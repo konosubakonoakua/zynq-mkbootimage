@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <arch/zynq.h>
 #include <arch/zynqmp.h>
@@ -39,11 +40,14 @@
 /* Prepare global variables for arg parser */
 const char *argp_program_version = MKBOOTIMAGE_VER;
 static char doc[] = "Generate bootloader images for Xilinx Zynq based platforms.";
-static char args_doc[] = "[--parse-only|-p] [--zynqmp|-u] <input_bif_file> <output_bin_file>";
+static char args_doc[] = "[--parse-only|-p] [--zynqmp|-u] [--bit2bin|-b] [-i INPUT] [-o OUTPUT] [<input>] [<output>]";
 
 static struct argp_option argp_options[] = {
   {"zynqmp", 'u', 0, 0, "Generate files for ZyqnMP (default is Zynq)", 0},
   {"parse-only", 'p', 0, 0, "Analyze BIF grammar, but don't generate any files", 0},
+  {"bit2bin", 'b', 0, 0, "Treat input as bitstream and auto-generate BIF in memory", 0},
+  {"input", 'i', "FILE", 0, "Input BIF/bit file (default: positional or derived)", 0},
+  {"output", 'o', "FILE", 0, "Output bin file (default: derived from input)", 0},
   {0},
 };
 
@@ -51,9 +55,39 @@ static struct argp_option argp_options[] = {
 struct arguments {
   bool zynqmp;
   bool parse_only;
+  bool bit2bin;
   char *bif_filename;
   char *bin_filename;
 };
+
+static char *derive_filename(const char *src, const char *new_ext) {
+  const char *sep = strrchr(src, '/');
+  const char *sep_back = strrchr(src, '\\');
+  const char *base = sep;
+  size_t prefix_len;
+  char *dot;
+  char *out;
+
+  if (!base || (sep_back && sep_back > base))
+    base = sep_back;
+  if (base)
+    base++;
+  else
+    base = src;
+
+  dot = strrchr(base, '.');
+  if (dot)
+    prefix_len = (size_t)(dot - src);
+  else
+    prefix_len = strlen(src);
+
+  out = malloc(prefix_len + strlen(new_ext) + 1);
+  if (!out)
+    return NULL;
+  memcpy(out, src, prefix_len);
+  strcpy(out + prefix_len, new_ext);
+  return out;
+}
 
 /* Define argument parser */
 static error_t argp_parser(int key, char *arg, struct argp_state *state) {
@@ -66,12 +100,25 @@ static error_t argp_parser(int key, char *arg, struct argp_state *state) {
   case 'p':
     arguments->parse_only = true;
     break;
+  case 'b':
+    arguments->bit2bin = true;
+    break;
+  case 'i':
+    arguments->bif_filename = arg;
+    break;
+  case 'o':
+    arguments->bin_filename = arg;
+    break;
   case ARGP_KEY_ARG:
     switch (state->arg_num) {
     case 0:
+      if (arguments->bif_filename || arguments->bin_filename)
+        argp_usage(state);
       arguments->bif_filename = arg;
       break;
     case 1:
+      if (arguments->bin_filename)
+        argp_usage(state);
       arguments->bin_filename = arg;
       break;
     default:
@@ -79,9 +126,7 @@ static error_t argp_parser(int key, char *arg, struct argp_state *state) {
     }
     break;
   case ARGP_KEY_END:
-    if (state->arg_num < 1)
-      argp_usage(state);
-    else if (state->arg_num < 2 && !arguments->parse_only)
+    if (!arguments->bif_filename && !arguments->bin_filename)
       argp_usage(state);
     break;
   default:
@@ -104,12 +149,34 @@ int main(int argc, char *argv[]) {
   bif_cfg_t cfg;
   error err;
   int i;
+  char *derived_input = NULL;
+  char *derived_output = NULL;
+  int ret = EXIT_FAILURE;
 
   /* Init non-string arguments */
   memset(&arguments, 0, sizeof(arguments));
 
   /* Parse program arguments */
   argp_parse(&argp, argc, argv, 0, 0, &arguments);
+
+  if (!arguments.bif_filename) {
+    const char *ext = arguments.bit2bin ? ".bit" : ".bif";
+    derived_input = derive_filename(arguments.bin_filename, ext);
+    if (!derived_input) {
+      ret = ERROR_NOMEM;
+      goto cleanup;
+    }
+    arguments.bif_filename = derived_input;
+  }
+
+  if (!arguments.bin_filename && !arguments.parse_only) {
+    derived_output = derive_filename(arguments.bif_filename, ".bin");
+    if (!derived_output) {
+      ret = ERROR_NOMEM;
+      goto cleanup;
+    }
+    arguments.bin_filename = derived_output;
+  }
 
   /* Print program version info */
   printf("%s\n", MKBOOTIMAGE_VER);
@@ -120,11 +187,24 @@ int main(int argc, char *argv[]) {
   cfg.arch = (arguments.zynqmp) ? BIF_ARCH_ZYNQMP : BIF_ARCH_ZYNQ;
   bops = (arguments.zynqmp) ? &zynqmp_bops : &zynq_bops;
 
-  err = bif_parse(arguments.bif_filename, &cfg);
-  if (err)
-    return err;
+  if (arguments.bit2bin) {
+    const char *fmt = "all: { %s }\n";
+    size_t bif_len = snprintf(NULL, 0, fmt, arguments.bif_filename) + 1;
+    char *bif_buf = malloc(bif_len);
+    if (!bif_buf)
+      return ERROR_NOMEM;
+    snprintf(bif_buf, bif_len, fmt, arguments.bif_filename);
+    err = bif_parse_buf(bif_buf, strlen(bif_buf), "<bit2bin>", &cfg);
+    free(bif_buf);
+  } else {
+    err = bif_parse(arguments.bif_filename, &cfg);
+  }
+  if (err) {
+    ret = err;
+    goto cleanup_cfg;
+  }
   if (cfg.nodes_num == 0)
-    return ERROR_BOOTROM_NOFILE;
+    goto cleanup_no_file;
 
   printf("Nodes found in the %s file:\n", arguments.bif_filename);
   for (i = 0; i < cfg.nodes_num; i++) {
@@ -141,13 +221,14 @@ int main(int argc, char *argv[]) {
 
   if (arguments.parse_only) {
     printf("The source BIF has a correct syntax\n");
-    return EXIT_SUCCESS;
+    ret = EXIT_SUCCESS;
+    goto cleanup_cfg;
   }
 
   /* Estimate memory required to fit all the binaries */
   esize = estimate_boot_image_size(&cfg);
   if (!esize)
-    return ERROR_BOOTROM_NOFILE;
+    goto cleanup_no_file;
 
   /* Align estimated size to powers of two */
   esize_aligned = 2;
@@ -157,28 +238,42 @@ int main(int argc, char *argv[]) {
   /* Allocate memory for output image */
   file_data = malloc(sizeof *file_data * esize_aligned);
   if (!file_data) {
-    return ERROR_NOMEM;
+    ret = ERROR_NOMEM;
+    goto cleanup_cfg;
   }
 
   /* Generate bin file */
   err = create_boot_image(file_data, &cfg, bops, &ofile_size);
   if (err) {
     free(file_data);
-    return err;
+    ret = err;
+    goto cleanup_cfg;
   }
 
   ofile = fopen(arguments.bin_filename, "wb");
   if (ofile == NULL) {
     errorf("could not open output file: %s\n", arguments.bin_filename);
-    return ERROR_CANT_WRITE;
+    ret = ERROR_CANT_WRITE;
+    free(file_data);
+    goto cleanup_cfg;
   }
 
   fwrite(file_data, sizeof(uint32_t), ofile_size, ofile);
 
   fclose(ofile);
   free(file_data);
-  deinit_bif_cfg(&cfg);
 
   printf("All done, quitting\n");
-  return EXIT_SUCCESS;
+  ret = EXIT_SUCCESS;
+
+cleanup_cfg:
+  deinit_bif_cfg(&cfg);
+cleanup:
+  free(derived_input);
+  free(derived_output);
+  return ret;
+
+cleanup_no_file:
+  ret = ERROR_BOOTROM_NOFILE;
+  goto cleanup_cfg;
 }

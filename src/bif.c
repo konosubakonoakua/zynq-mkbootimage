@@ -44,6 +44,9 @@ static inline char *get_token_name(int type);
 static inline void update_pos(lexer_t *lex, char ch);
 static inline error append_token(lexer_t *lex, char ch);
 
+static inline int lex_getc(lexer_t *lex);
+static inline void lex_ungetc(lexer_t *lex, int ch);
+
 static error bif_scan(lexer_t *lex);
 static inline error bif_consume(lexer_t *lex, int type);
 static inline error bif_expect(lexer_t *lex, int type);
@@ -101,6 +104,10 @@ static error init_lexer(lexer_t *lex, const char *fname) {
 
   lex->line = lex->column = 1;
   lex->type = 0;
+  lex->buf = NULL;
+  lex->buf_len = 0;
+  lex->buf_pos = 0;
+  lex->from_buf = 0;
 
   lex->len = lex->cap = 32;
   lex->buffer = malloc(lex->cap * sizeof(char));
@@ -114,12 +121,57 @@ static error init_lexer(lexer_t *lex, const char *fname) {
   return SUCCESS;
 }
 
+static error init_lexer_buf(lexer_t *lex, const char *buf, size_t len, const char *virtual_name) {
+  error err;
+
+  lex->file = NULL;
+  lex->buf = buf;
+  lex->buf_len = len;
+  lex->buf_pos = 0;
+  lex->from_buf = 1;
+
+  lex->fname = malloc(strlen(virtual_name) + 1);
+  strcpy(lex->fname, virtual_name);
+
+  lex->line = lex->column = 1;
+  lex->type = 0;
+
+  lex->len = lex->cap = 32;
+  lex->buffer = malloc(lex->cap * sizeof(char));
+
+  if ((err = bif_scan(lex)))
+    return err;
+
+  return SUCCESS;
+}
+
 static error deinit_lexer(lexer_t *lex) {
-  fclose(lex->file);
+  if (lex->file)
+    fclose(lex->file);
   free(lex->fname);
   free(lex->buffer);
 
   return SUCCESS;
+}
+
+static inline int lex_getc(lexer_t *lex) {
+  if (lex->from_buf) {
+    if (lex->buf_pos >= lex->buf_len)
+      return EOF;
+    return (unsigned char)lex->buf[lex->buf_pos++];
+  }
+  return fgetc(lex->file);
+}
+
+static inline void lex_ungetc(lexer_t *lex, int ch) {
+  if (ch < 0)
+    return;
+  if (lex->from_buf) {
+    if (lex->buf_pos > 0)
+      lex->buf_pos--;
+    return;
+  }
+  ungetc(ch, lex->file);
 }
 
 static inline char *get_token_name(int type) {
@@ -188,7 +240,7 @@ static inline error bif_scan_comment(lexer_t *lex, char type) {
     for (;;) {
       prev = ch;
       /* Break if its the end of file */
-      if ((ch = fgetc(lex->file)) < 0) {
+      if ((ch = lex_getc(lex)) < 0) {
         perrorf(lex, "file ended while scanning a C-style comment\n");
         return ERROR_BIF_LEXER;
       }
@@ -199,7 +251,7 @@ static inline error bif_scan_comment(lexer_t *lex, char type) {
     }
     /* Don't update the pos after the last ch, it will happen in bif_scan */
   } else if (type == '/') {
-    while ((ch = fgetc(lex->file)) >= 0 && ch != '\n')
+    while ((ch = lex_getc(lex)) >= 0 && ch != '\n')
       update_pos(lex, ch);
     /* Don't update the pos after the last ch, it will happen in bif_scan */
   }
@@ -215,7 +267,7 @@ static error bif_scan(lexer_t *lex) {
   /* Skip white chars and comments */
   for (;;) {
     prev = ch;
-    ch = fgetc(lex->file);
+    ch = lex_getc(lex);
 
     if (ch < 0) {
       lex->type = TOKEN_EOF;
@@ -233,7 +285,7 @@ static error bif_scan(lexer_t *lex) {
       } else {
         /* The char after initial '/' didn't start a comment,
            so pretend it wasn't read */
-        ungetc(ch, lex->file);
+        lex_ungetc(lex, ch);
         ch = prev;
         break;
       }
@@ -267,7 +319,7 @@ static error bif_scan(lexer_t *lex) {
     lex->len = 0;
 
     for (;;) {
-      ch = fgetc(lex->file);
+      ch = lex_getc(lex);
 
       if (ch < 0) {
         perrorf(lex, "file ended while scanning a string\n");
@@ -289,10 +341,10 @@ static error bif_scan(lexer_t *lex) {
   } else {
     /* Scan a string being defined without " marks */
     for (;;) {
-      ch = fgetc(lex->file);
+      ch = lex_getc(lex);
 
       if (ch < 0 || strchr(special_chars, ch) || isspace(ch)) {
-        ungetc(ch, lex->file); /* we don't want that char */
+        lex_ungetc(lex, ch); /* we don't want that char */
         lex->type = TOKEN_NAME;
         break;
       }
@@ -414,6 +466,34 @@ error bif_parse(const char *fname, bif_cfg_t *cfg) {
   if ((err = bif_expect(&lex, '{')))
     return err;
   /* Parse the file list */
+  do {
+    if ((err = bif_parse_file(&lex, cfg, &node)))
+      return err;
+    if ((err = bif_cfg_add_node(cfg, &node)))
+      return err;
+  } while (lex.type == TOKEN_NAME || lex.type == '[');
+  if ((err = bif_expect(&lex, '}')))
+    return err;
+
+  deinit_lexer(&lex);
+
+  return SUCCESS;
+}
+
+error bif_parse_buf(const char *buf, size_t len, const char *virtual_name, bif_cfg_t *cfg) {
+  error err;
+  lexer_t lex;
+  bif_node_t node;
+
+  if ((err = init_lexer_buf(&lex, buf, len, virtual_name)))
+    return err;
+
+  if ((err = bif_expect(&lex, TOKEN_NAME)))
+    return err;
+  if ((err = bif_expect(&lex, ':')))
+    return err;
+  if ((err = bif_expect(&lex, '{')))
+    return err;
   do {
     if ((err = bif_parse_file(&lex, cfg, &node)))
       return err;

@@ -22,6 +22,10 @@ enum token_type
 typedef struct lexer_t {
   FILE *file; /* the file being parsed */
   char *fname;
+  const char *buf;
+  size_t buf_len;
+  size_t buf_pos;
+  uint8_t from_buf;
 
   int line, column;
 
@@ -70,5 +74,6 @@ error bif_node_set_attr(
   lexer_t *lex, bif_cfg_t *cfg, bif_node_t *node, char *attr_name, char *value);
 
 error bif_parse(const char *fname, bif_cfg_t *cfg);
+error bif_parse_buf(const char *buf, size_t len, const char *virtual_name, bif_cfg_t *cfg);
 
 #endif /* BIF_PARSER_H */

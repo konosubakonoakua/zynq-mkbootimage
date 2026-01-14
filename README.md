@@ -22,7 +22,7 @@ For details on project organization and contribution tips, see `src/README.md`.
 
 To use it, type in:
 ```
-./mkbootimage [--parse-only|-p] [--zynqmp|-u] <input_bif_file> <output_bin_file>
+./mkbootimage [--parse-only|-p] [--zynqmp|-u] [--bit2bin|-b] [-i INPUT] [-o OUTPUT] [<input>] [<output>]
 ```
 
 To see all available options, run:
@@ -60,6 +60,21 @@ used with the following command:
 will generate a `.bin` image which can be used in U-Boot, as follows:
 ```
 bootm 0x3000000 0x2000000 0x2a00000
+```
+
+### Bitstream-only (auto BIF)
+
+If you only need to convert a `.bit` file into a `.bin` boot image, use
+`--bit2bin` to generate a minimal BIF in memory:
+```
+./mkbootimage --bit2bin fpga.bit boot.bin
+```
+
+You can also use explicit input/output flags, and omit one to derive it from
+the other:
+```
+./mkbootimage -i boot.bif
+./mkbootimage -o boot.bin
 ```
 
 ### Zynq UltraScale+
@@ -168,4 +183,3 @@ the boot image name:
 ```
 ./exbootimage -x boot.bin fpga.bit rootfs.img
 ```
-
